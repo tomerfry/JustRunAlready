@@ -477,6 +477,9 @@ class IterDebugger:
         self.state_path = self.outdir / "state.json"
         
         self._gdb_proc: Optional[subprocess.Popen] = None
+        self.use_tmux = False
+        self.timeout = 60.0
+        self._tmux_pane_id: Optional[str] = None
     
     # ---- State Management ----
     
@@ -519,6 +522,273 @@ class IterDebugger:
         }
         with open(self.state_path, 'w') as f:
             json.dump(data, f, indent=2)
+    
+    # ---- Tmux Support ----
+    
+    def _check_tmux(self) -> bool:
+        """Check if we're running inside tmux"""
+        return 'TMUX' in os.environ
+    
+    def _tmux_create_pane(self) -> bool:
+        """Create a tmux split pane for QEMU output"""
+        if not self._check_tmux():
+            log.warn("Not running in tmux - cannot create split pane")
+            log.info("Run inside tmux or use: tmux new-session -s debug")
+            return False
+        
+        try:
+            # Create a vertical split pane (right side)
+            # Use -l for size (percentage or absolute) - more compatible than -p
+            result = subprocess.run(
+                ['tmux', 'split-window', '-h', '-l', '40%', '-P', '-F', '#{pane_id}'],
+                capture_output=True, text=True
+            )
+            
+            # If -l 40% didn't work, try without percentage
+            if result.returncode != 0:
+                result = subprocess.run(
+                    ['tmux', 'split-window', '-h', '-l', '60', '-P', '-F', '#{pane_id}'],
+                    capture_output=True, text=True
+                )
+            
+            # If that also failed, try minimal split
+            if result.returncode != 0:
+                result = subprocess.run(
+                    ['tmux', 'split-window', '-h', '-P', '-F', '#{pane_id}'],
+                    capture_output=True, text=True, check=True
+                )
+            
+            self._tmux_pane_id = result.stdout.strip()
+            
+            if not self._tmux_pane_id:
+                log.error("tmux didn't return pane id")
+                return False
+            
+            # Set pane title (may not work on all versions)
+            subprocess.run(
+                ['tmux', 'select-pane', '-t', self._tmux_pane_id, '-T', 'QEMU'],
+                capture_output=True
+            )
+            
+            # Focus back on the original pane
+            subprocess.run(['tmux', 'select-pane', '-L'], capture_output=True)
+            
+            log.ok(f"Created tmux pane: {self._tmux_pane_id}")
+            return True
+            
+        except subprocess.CalledProcessError as e:
+            error_msg = e.stderr.strip() if e.stderr else str(e)
+            log.error(f"Failed to create tmux pane: {error_msg}")
+            return False
+        except FileNotFoundError:
+            log.error("tmux not found")
+            return False
+    
+    def _tmux_run_qemu_in_pane(self) -> bool:
+        """Run QEMU in the tmux pane"""
+        if not self._tmux_pane_id:
+            return False
+        
+        # Build the QEMU command
+        ld_path = "/lib:/usr/lib:/lib/aarch64-linux-gnu:/usr/lib/aarch64-linux-gnu:/lib/arm-linux-gnueabihf:/usr/lib/arm-linux-gnueabihf:/mnt:/opt/lib:/opt"
+        
+        qemu_cmd = (
+            f"sudo chroot {self.qemu.chroot} "
+            f"/{self.qemu.cfg['qemu']} "
+            f"-E LD_LIBRARY_PATH={ld_path} "
+            f"-g {self.qemu.port} "
+            f"{self.qemu.binary} {' '.join(self.qemu.args)}"
+        )
+        
+        try:
+            # Clear the pane first
+            subprocess.run(
+                ['tmux', 'send-keys', '-t', self._tmux_pane_id, 'clear', 'Enter'],
+                check=True, capture_output=True
+            )
+            time.sleep(0.2)
+            
+            # Run the command
+            subprocess.run(
+                ['tmux', 'send-keys', '-t', self._tmux_pane_id, 
+                 f"echo '=== QEMU Output (port {self.qemu.port}) ===' && {qemu_cmd}", 'Enter'],
+                check=True, capture_output=True
+            )
+            
+            # Wait longer for sudo password and QEMU to start
+            log.info("Waiting for QEMU to start (check right pane for sudo prompt)...")
+            time.sleep(2.0)
+            
+            # Check if GDB port is listening (indicates QEMU is ready)
+            for _ in range(10):  # Wait up to 5 more seconds
+                try:
+                    import socket
+                    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    sock.settimeout(0.5)
+                    result = sock.connect_ex(('localhost', self.qemu.port))
+                    sock.close()
+                    if result == 0:
+                        log.ok("QEMU GDB server is ready")
+                        return True
+                except:
+                    pass
+                time.sleep(0.5)
+            
+            log.warn("Could not confirm QEMU is ready, continuing anyway...")
+            return True
+            
+        except subprocess.CalledProcessError as e:
+            log.error(f"Failed to run QEMU in pane: {e}")
+            return False
+    
+    def _tmux_kill_pane(self):
+        """Kill the QEMU pane"""
+        if self._tmux_pane_id:
+            try:
+                # Send Ctrl+C to stop QEMU
+                subprocess.run(
+                    ['tmux', 'send-keys', '-t', self._tmux_pane_id, 'C-c'],
+                    capture_output=True
+                )
+                time.sleep(0.5)
+                
+                # Kill the pane
+                subprocess.run(
+                    ['tmux', 'kill-pane', '-t', self._tmux_pane_id],
+                    capture_output=True
+                )
+            except:
+                pass
+            self._tmux_pane_id = None
+    
+    def _tmux_stop_qemu(self):
+        """Stop QEMU in the tmux pane without killing the pane"""
+        if self._tmux_pane_id:
+            try:
+                # Send Ctrl+C to stop QEMU
+                subprocess.run(
+                    ['tmux', 'send-keys', '-t', self._tmux_pane_id, 'C-c'],
+                    capture_output=True
+                )
+                time.sleep(0.3)
+            except:
+                pass
+    
+    def _run_with_tmux(self, timeout: float) -> tuple[bool, str, Failure]:
+        """Run with QEMU in tmux pane"""
+        # Stop any previous QEMU
+        self._tmux_stop_qemu()
+        
+        # Start QEMU in the tmux pane
+        if not self._tmux_run_qemu_in_pane():
+            return False, "Failed to start QEMU in tmux", Failure(FailType.UNKNOWN)
+        
+        # Now run GDB
+        gdb_cmd = [
+            self.qemu.cfg['gdb'],
+            '-batch',
+            '-x', str(self.script_path),
+        ]
+        
+        log.debug(f"GDB command: {' '.join(gdb_cmd)}")
+        
+        try:
+            self._gdb_proc = subprocess.Popen(
+                gdb_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True
+            )
+            
+            output_lines = []
+            start = time.time()
+            
+            while time.time() - start < timeout:
+                if self._gdb_proc.poll() is not None:
+                    break
+                
+                try:
+                    rlist, _, _ = select.select([self._gdb_proc.stdout], [], [], 0.5)
+                    if rlist:
+                        line = self._gdb_proc.stdout.readline()
+                        if line:
+                            line = line.rstrip()
+                            output_lines.append(line)
+                            
+                            if '[H]' in line:
+                                log.hook("", line.split('[H]')[1].strip())
+                            elif Logger.VERBOSE:
+                                print(f"{C.DIM}{line}{C.E}")
+                except:
+                    pass
+            
+            if self._gdb_proc.poll() is None:
+                log.warn("Timeout - program is still running")
+                log.info("This may be normal for a service/daemon that doesn't exit")
+                self._gdb_proc.terminate()
+                try:
+                    remaining, _ = self._gdb_proc.communicate(timeout=2)
+                    output_lines.extend(remaining.split('\n'))
+                except:
+                    self._gdb_proc.kill()
+                
+                output = '\n'.join(output_lines)
+                
+                # Check if this looks like a successful run (no crash, just timeout)
+                if "SIGSEGV" not in output and "SIGABRT" not in output and "exited with code" not in output:
+                    log.ok("Program appears to be running successfully (no crash detected)")
+                    fail = Failure(FailType.TIMEOUT)
+                    fail.info['status'] = 'running'
+                    fail.info['note'] = 'Program did not crash - may be waiting for input/connection'
+                    return False, output, fail
+            else:
+                remaining = self._gdb_proc.stdout.read()
+                output_lines.extend(remaining.split('\n'))
+            
+            output = '\n'.join(output_lines)
+            
+            # Parse results (same as regular mode)
+            if "exited normally" in output:
+                log.ok("Program exited normally!")
+                return True, output, Failure(FailType.UNKNOWN)
+            
+            if "exited with code 0177" in output or "exited with code 127" in output:
+                symbol_match = re.search(r'undefined symbol:\s*(\S+)', output)
+                if symbol_match:
+                    fail = Failure(FailType.SYMBOL_MISSING)
+                    fail.info['exit_code'] = 127
+                    fail.info['missing_symbol'] = symbol_match.group(1)
+                    return False, output, fail
+                
+                fail = Failure(FailType.LIB_MISSING)
+                fail.info['exit_code'] = 127
+                lib_match = re.search(r'error while loading shared libraries:\s*(\S+):', output)
+                if lib_match:
+                    fail.info['missing_lib'] = lib_match.group(1)
+                return False, output, fail
+            
+            exit_match = re.search(r'exited with code (\d+)', output)
+            if exit_match:
+                code = int(exit_match.group(1))
+                if code == 0:
+                    log.ok("Program exited with code 0")
+                    return True, output, Failure(FailType.UNKNOWN)
+                else:
+                    log.warn(f"Program exited with code {code}")
+                    fail = Failure(FailType.UNKNOWN)
+                    fail.info['exit_code'] = code
+                    return False, output, fail
+            
+            failure = self._parse_output(output)
+            self.history.append(failure)
+            return False, output, failure
+            
+        except Exception as e:
+            log.error(f"GDB failed: {e}")
+            return False, str(e), Failure(FailType.UNKNOWN)
+        finally:
+            self._gdb_proc = None
+            # Don't stop QEMU in tmux - let user see the output
     
     # ---- Binary Analysis ----
     
@@ -665,13 +935,21 @@ class IterDebugger:
     
     # ---- Execution ----
     
-    def run(self, timeout: float = 60.0) -> tuple[bool, str, Failure]:
+    def run(self, timeout: float = None) -> tuple[bool, str, Failure]:
         """Run with GDB and current script"""
+        if timeout is None:
+            timeout = self.timeout
+            
         self.iteration += 1
         log.header(f"Iteration {self.iteration}")
         
         self.gen_script()
         
+        # Use tmux pane for QEMU if enabled
+        if self.use_tmux and self._tmux_pane_id:
+            return self._run_with_tmux(timeout)
+        
+        # Regular mode - QEMU in background
         if not self.qemu.start():
             # Check if QEMU captured a library error
             if self.qemu.last_error:
@@ -944,6 +1222,40 @@ class IterDebugger:
         print(f"  {C.R}Type:{C.E}    {fail.type.name}")
         print(f"  {C.R}Address:{C.E} 0x{fail.addr:08x}")
         print(f"  {C.R}Function:{C.E} {fail.func or 'unknown'}")
+        
+        # Special handling for timeout (program still running)
+        if fail.type == FailType.TIMEOUT:
+            print(f"\n  {C.G}The program is running!{C.E}")
+            print(f"  {C.C}It didn't crash - it's waiting for something (input, connection, etc.){C.E}")
+            if self.use_tmux:
+                print(f"  {C.C}Check the right pane for program output.{C.E}")
+            
+            print(f"\n{C.Y}Options:{C.E}")
+            print("  c. Continue (let it run, re-attach later)")
+            print("  i. Interrupt and inspect (send SIGINT)")
+            print("  5. Show GDB output")
+            print("  9. Save & quit (leave program running in tmux)")
+            print("  0. Quit and stop program")
+            
+            while True:
+                choice = input(f"\n{C.G}Choice: {C.E}").strip().lower()
+                
+                if choice == 'c':
+                    log.ok("Program left running. Re-run script to re-attach.")
+                    return None
+                elif choice == 'i':
+                    # TODO: Send interrupt to examine state
+                    log.info("Interrupt not yet implemented - use GDB manually")
+                elif choice == '5':
+                    print(f"\n{C.DIM}{output}{C.E}")
+                elif choice == '9':
+                    self.save()
+                    log.ok("Saved. Program still running in tmux pane.")
+                    sys.exit(0)
+                elif choice == '0':
+                    if self.use_tmux:
+                        self._tmux_stop_qemu()
+                    sys.exit(0)
         
         # Special handling for undefined symbol errors
         if fail.type == FailType.SYMBOL_MISSING:
@@ -1898,6 +2210,19 @@ void* {symbol}(void) {{
         
         self.load()
         
+        # Set up tmux if requested
+        if self.use_tmux:
+            if self._check_tmux():
+                if self._tmux_create_pane():
+                    log.ok("Tmux split pane ready - QEMU output will appear on the right")
+                else:
+                    log.warn("Failed to create tmux pane, continuing without")
+                    self.use_tmux = False
+            else:
+                log.warn("Not in tmux session. Run: tmux new-session -s debug")
+                log.info("Continuing without tmux split...")
+                self.use_tmux = False
+        
         # Preflight check - run without GDB to catch library errors
         log.info("Running preflight check...")
         ok, error_info = self.qemu.preflight_check()
@@ -1982,6 +2307,8 @@ The tool will:
     parser.add_argument('-v', '--verbose', action='store_true', help='Verbose output')
     parser.add_argument('--reset', action='store_true', help='Clear previous state')
     parser.add_argument('--max-iter', type=int, default=100, help='Max iterations')
+    parser.add_argument('--tmux', action='store_true', help='Use tmux split pane for QEMU output')
+    parser.add_argument('--timeout', type=float, default=60.0, help='GDB timeout in seconds (default: 60)')
     
     args = parser.parse_args()
     
@@ -2003,6 +2330,8 @@ The tool will:
     )
     
     debugger = IterDebugger(qemu, outdir=args.output)
+    debugger.use_tmux = args.tmux
+    debugger.timeout = args.timeout
     
     if args.reset and debugger.state_path.exists():
         debugger.state_path.unlink()
@@ -2013,7 +2342,18 @@ The tool will:
     except KeyboardInterrupt:
         print("\nInterrupted")
         debugger.save()
+        if debugger.use_tmux:
+            debugger._tmux_kill_pane()
         sys.exit(1)
+    finally:
+        if debugger.use_tmux:
+            # Ask if user wants to keep the pane
+            try:
+                keep = input(f"\n{C.Y}Keep tmux pane open? [y/N]: {C.E}").strip().lower()
+                if keep not in ('y', 'yes'):
+                    debugger._tmux_kill_pane()
+            except:
+                debugger._tmux_kill_pane()
 
 
 if __name__ == '__main__':
