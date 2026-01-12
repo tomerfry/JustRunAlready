@@ -1026,6 +1026,11 @@ class IterDebugger:
             for k, v in fail.info.items():
                 print(f"    {k}: {v}")
         
+        # Suggest showing output for non-signal failures
+        if fail.type == FailType.UNKNOWN and fail.info.get('exit_code'):
+            print(f"\n  {C.Y}Tip:{C.E} Program exited with error. Try option 5 to see full output,")
+            print(f"       or re-run with arguments: --args -n -h  (to see program's help)")
+        
         print(f"\n{C.Y}Actions:{C.E}")
         print("  1. Skip call (jump past it)")
         print("  2. Force return value")
@@ -1735,7 +1740,8 @@ The tool will:
     parser.add_argument('-a', '--arch', required=True, choices=list(ARCHS.keys()), help='Architecture')
     parser.add_argument('-p', '--port', type=int, default=1234, help='GDB port (default: 1234)')
     parser.add_argument('-o', '--output', default='./qemu_session', help='Output directory')
-    parser.add_argument('--args', nargs='*', default=[], help='Binary arguments')
+    parser.add_argument('--args', nargs=argparse.REMAINDER, default=[],
+                       help='Arguments to pass to the binary (everything after --args)')
     parser.add_argument('-v', '--verbose', action='store_true', help='Verbose output')
     parser.add_argument('--reset', action='store_true', help='Clear previous state')
     parser.add_argument('--max-iter', type=int, default=100, help='Max iterations')
