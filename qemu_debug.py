@@ -357,7 +357,8 @@ class QEMU:
         self.setup()
         
         # Add common library paths via LD_LIBRARY_PATH
-        ld_path = "/lib:/usr/lib:/lib/aarch64-linux-gnu:/usr/lib/aarch64-linux-gnu"
+        # Include non-standard paths like /mnt, /opt where some firmware stores libs
+        ld_path = "/lib:/usr/lib:/lib/aarch64-linux-gnu:/usr/lib/aarch64-linux-gnu:/lib/arm-linux-gnueabihf:/usr/lib/arm-linux-gnueabihf:/mnt:/opt/lib:/opt"
         
         cmd = ['sudo', 'chroot', str(self.chroot), 
                f"/{self.cfg['qemu']}", 
@@ -398,8 +399,8 @@ class QEMU:
         """Start QEMU with GDB server"""
         self.setup()
         
-        # Add common library paths
-        ld_path = "/lib:/usr/lib:/lib/aarch64-linux-gnu:/usr/lib/aarch64-linux-gnu"
+        # Add common library paths (including non-standard paths like /mnt, /opt)
+        ld_path = "/lib:/usr/lib:/lib/aarch64-linux-gnu:/usr/lib/aarch64-linux-gnu:/lib/arm-linux-gnueabihf:/usr/lib/arm-linux-gnueabihf:/mnt:/opt/lib:/opt"
         
         cmd = ['sudo', 'chroot', str(self.chroot)]
         
@@ -425,9 +426,9 @@ class QEMU:
             time.sleep(0.5)
             
             if self.proc.poll() is not None:
-                _, stderr = self.proc.communicate()
-                self.last_error = stderr
-                log.error(f"QEMU died: {stderr[:500]}")
+                stdout, stderr = self.proc.communicate()
+                self.last_error = stderr or stdout or "No error message captured"
+                log.error(f"QEMU died: {self.last_error[:500]}")
                 return False
             
             self.last_error = ""
@@ -675,12 +676,27 @@ class IterDebugger:
             # Check if QEMU captured a library error
             if self.qemu.last_error:
                 log.debug(f"QEMU error: {self.qemu.last_error}")
+                
+                # Check for library error
                 lib_match = re.search(r'error while loading shared libraries:\s*(\S+):', self.qemu.last_error)
                 if lib_match:
                     fail = Failure(FailType.LIB_MISSING)
                     fail.info['missing_lib'] = lib_match.group(1)
                     return False, self.qemu.last_error, fail
-            return False, "QEMU start failed", Failure(FailType.UNKNOWN)
+                
+                # Check for symbol error
+                symbol_match = re.search(r'undefined symbol:\s*(\S+)', self.qemu.last_error)
+                if symbol_match:
+                    fail = Failure(FailType.SYMBOL_MISSING)
+                    fail.info['missing_symbol'] = symbol_match.group(1)
+                    return False, self.qemu.last_error, fail
+                
+                # Return the error as context
+                fail = Failure(FailType.UNKNOWN)
+                fail.info['qemu_error'] = self.qemu.last_error[:200]
+                return False, self.qemu.last_error, fail
+            
+            return False, "QEMU start failed (no error captured)", Failure(FailType.UNKNOWN)
         
         time.sleep(0.5)
         
@@ -1782,49 +1798,102 @@ void* {symbol}(void) {{
             log.info(f"Note: -b should be the path INSIDE the chroot, e.g., /usr/sbin/vj_generic")
             sys.exit(1)
         
+        # Check if binary is executable
+        if not os.access(binary_full, os.X_OK):
+            log.warn(f"Binary is not executable: {binary_full}")
+            fix = input(f"{C.Y}Fix permissions (chmod +x)? [Y/n]: {C.E}").strip().lower()
+            if fix in ('', 'y', 'yes'):
+                try:
+                    subprocess.run(['sudo', 'chmod', '+x', str(binary_full)], check=True)
+                    log.ok("Fixed permissions")
+                except Exception as e:
+                    log.error(f"Could not fix permissions: {e}")
+                    sys.exit(1)
+            else:
+                log.error("Binary must be executable to run")
+                sys.exit(1)
+        
         # Check for missing libraries
         missing_libs = self.check_libraries()
-        if missing_libs:
-            log.warn(f"Missing libraries detected:")
-            for lib in missing_libs:
-                # Try to find it elsewhere in the chroot
-                found = self.find_library_in_chroot(lib)
-                if found:
-                    print(f"    {C.Y}?{C.E} {lib}  (found at: {found})")
-                else:
+        found_elsewhere = {}
+        truly_missing = []
+        
+        for lib in missing_libs:
+            found = self.find_library_in_chroot(lib)
+            if found:
+                found_elsewhere[lib] = found
+            else:
+                truly_missing.append(lib)
+        
+        if found_elsewhere or truly_missing:
+            log.warn(f"Library issues detected:")
+            
+            if found_elsewhere:
+                print(f"\n  {C.Y}Found in non-standard paths (need symlink):{C.E}")
+                for lib, path in found_elsewhere.items():
+                    print(f"    {C.Y}•{C.E} {lib}  →  {path}")
+            
+            if truly_missing:
+                print(f"\n  {C.R}Not found anywhere:{C.E}")
+                for lib in truly_missing:
                     print(f"    {C.R}✗{C.E} {lib}")
-            print()
             
-            print(f"{C.Y}Options:{C.E}")
-            print("  1. Continue anyway (will fail at runtime)")
-            print("  2. Try to create stub libraries")
-            print("  3. Quit and fix manually")
+            print(f"\n{C.C}Options:{C.E}")
+            print("  1. Auto-fix: symlink found libraries to /lib")
+            print("  2. Continue anyway (may fail at runtime)")
+            print("  3. Create stub libraries for missing ones")
+            print("  4. Quit and fix manually")
             
-            choice = input(f"\n{C.G}Choice [1-3]: {C.E}").strip()
+            choice = input(f"\n{C.G}Choice [1-4]: {C.E}").strip()
             
-            if choice == '2':
-                for lib in missing_libs:
-                    # First check if found elsewhere
-                    found = self.find_library_in_chroot(lib)
-                    if found:
-                        # Symlink it to /usr/lib
-                        target = self.qemu.chroot / 'usr' / 'lib' / lib
-                        if not target.exists():
-                            try:
-                                rel_path = os.path.relpath(found, target.parent)
-                                subprocess.run(['sudo', 'ln', '-sf', str(found), str(target)], check=True)
-                                log.ok(f"Linked {lib} -> {found}")
-                            except Exception as e:
-                                log.warn(f"Could not link: {e}")
-                    else:
-                        self.create_stub_library(lib)
+            if choice == '1':
+                # Symlink found libraries
+                lib_dir = self.qemu.chroot / 'lib'
+                lib_dir.mkdir(parents=True, exist_ok=True)
+                
+                for lib, src_path in found_elsewhere.items():
+                    dst = lib_dir / lib
+                    if not dst.exists():
+                        try:
+                            # Create relative symlink
+                            rel_path = os.path.relpath(src_path, lib_dir)
+                            subprocess.run(['sudo', 'ln', '-sf', rel_path, str(dst)], check=True)
+                            log.ok(f"Linked: {lib} → {rel_path}")
+                        except Exception as e:
+                            log.error(f"Failed to link {lib}: {e}")
+                
+                # If there are still truly missing libs, offer to stub them
+                if truly_missing:
+                    print(f"\n{C.Y}Still missing {len(truly_missing)} libraries. Create stubs?{C.E}")
+                    if input("[Y/n]: ").strip().lower() in ('', 'y', 'yes'):
+                        for lib in truly_missing:
+                            self.create_stub_library(lib)
+                            
+            elif choice == '2':
+                pass  # Continue anyway
             elif choice == '3':
+                for lib in truly_missing:
+                    self.create_stub_library(lib)
+                # Also symlink the found ones
+                lib_dir = self.qemu.chroot / 'lib'
+                lib_dir.mkdir(parents=True, exist_ok=True)
+                for lib, src_path in found_elsewhere.items():
+                    dst = lib_dir / lib
+                    if not dst.exists():
+                        try:
+                            rel_path = os.path.relpath(src_path, lib_dir)
+                            subprocess.run(['sudo', 'ln', '-sf', rel_path, str(dst)], check=True)
+                            log.ok(f"Linked: {lib} → {rel_path}")
+                        except Exception as e:
+                            log.error(f"Failed to link {lib}: {e}")
+            elif choice == '4':
                 log.info("Tips:")
-                log.info("  - Find the library from another firmware or SDK")
-                log.info("  - Copy to chroot: sudo cp libfoo.so /path/to/chroot/usr/lib/")
-                log.info("  - Or use LD_PRELOAD with a stub")
+                log.info("  - Symlink libraries to /lib in the chroot:")
+                for lib, path in found_elsewhere.items():
+                    print(f"    sudo ln -s {path} {self.qemu.chroot}/lib/{lib}")
+                log.info("  - Or set LD_LIBRARY_PATH when running")
                 sys.exit(1)
-            elif choice != '1':
+            else:
                 sys.exit(1)
         
         self.load()
