@@ -841,23 +841,68 @@ class IterDebugger:
                 fail.type = ftype
                 break
         
-        # Address extraction
-        pc_patterns = [
-            r'0x([0-9a-fA-F]+)\s+in\s+(\w+)',
-            r'\$pc\s*=\s*0x([0-9a-fA-F]+)',
-            r'at\s+0x([0-9a-fA-F]+)',
-        ]
+        # Parse backtrace first - this is the authoritative source
+        # Format: #0  0x00012345 in function_name () at file.c:123
+        #    or:  #0  0x00012345 in function_name ()
+        #    or:  #0  0x00012345 in ?? ()
+        bt_pattern = r'#(\d+)\s+(?:0x)?([0-9a-fA-F]+)\s+in\s+(\S+)\s*\([^)]*\)(?:\s+at\s+(\S+))?'
+        bt_matches = re.findall(bt_pattern, output)
         
-        for pattern in pc_patterns:
-            match = re.search(pattern, output)
-            if match:
-                fail.addr = int(match.group(1), 16)
-                if len(match.groups()) > 1:
-                    fail.func = match.group(2)
-                break
+        fail.bt = []
+        for match in bt_matches[:10]:
+            frame_num, addr, func, source = match
+            addr_int = int(addr, 16)
+            # Clean up function name (remove trailing garbage)
+            func = func.split('@')[0] if '@' in func else func
+            
+            bt_entry = {
+                'frame': int(frame_num),
+                'addr': addr_int,
+                'func': func if func != '??' else '',
+                'source': source if source else ''
+            }
+            fail.bt.append(bt_entry)
         
-        # Backtrace
-        fail.bt = re.findall(r'#\d+\s+0x[0-9a-fA-F]+\s+in\s+\S+.*', output)[:10]
+        # For signals, the fault location is typically frame #0
+        # But we want the FIRST frame that's in user code (not libc, not ld-linux)
+        if fail.bt:
+            # Default to frame 0
+            fail.addr = fail.bt[0]['addr']
+            fail.func = fail.bt[0]['func']
+            
+            # Try to find the first "interesting" frame (not in system libs)
+            system_prefixes = ('__', '_dl_', '_start', 'ld-linux', '__libc_', '_GI_')
+            for entry in fail.bt:
+                func = entry['func']
+                if func and not any(func.startswith(p) for p in system_prefixes):
+                    fail.addr = entry['addr']
+                    fail.func = func
+                    fail.info['fault_frame'] = entry['frame']
+                    break
+        
+        # Also check for "Program received signal" line which may have fault address
+        # Format: Program received signal SIGSEGV, Segmentation fault.
+        #         0x00012345 in function ()
+        sig_addr_match = re.search(
+            r'Program received signal \w+.*?\n\s*(?:0x)?([0-9a-fA-F]+)\s+in\s+(\S+)',
+            output, re.MULTILINE
+        )
+        if sig_addr_match:
+            # This is the actual fault location, prefer it
+            fail.addr = int(sig_addr_match.group(1), 16)
+            fail.func = sig_addr_match.group(2).split('(')[0].split('@')[0]
+        
+        # If we still don't have an address, try other patterns
+        if fail.addr == 0:
+            # Try: stopped at 0x12345
+            stop_match = re.search(r'stopped.*?(?:0x)?([0-9a-fA-F]{6,})', output, re.IGNORECASE)
+            if stop_match:
+                fail.addr = int(stop_match.group(1), 16)
+            
+            # Try: $pc = 0x12345
+            pc_match = re.search(r'\$pc\s*=\s*(?:0x)?([0-9a-fA-F]+)', output)
+            if pc_match:
+                fail.addr = int(pc_match.group(1), 16)
         
         # File issues from hooks
         file_match = re.search(r'\[H\]\s*(?:open|fopen|access|stat)\("([^"]+)"', output)
@@ -1018,8 +1063,20 @@ class IterDebugger:
         
         if fail.bt:
             print(f"\n  {C.C}Backtrace:{C.E}")
-            for line in fail.bt[:5]:
-                print(f"    {line}")
+            for entry in fail.bt[:8]:
+                if isinstance(entry, dict):
+                    frame = entry.get('frame', '?')
+                    addr = entry.get('addr', 0)
+                    func = entry.get('func', '??')
+                    source = entry.get('source', '')
+                    
+                    # Highlight the frame we identified as the culprit
+                    marker = f"{C.R}→{C.E}" if addr == fail.addr else " "
+                    source_str = f" at {source}" if source else ""
+                    print(f"   {marker} #{frame}  0x{addr:08x} in {func or '??'}(){source_str}")
+                else:
+                    # Legacy string format
+                    print(f"    {entry}")
         
         if fail.info:
             print(f"\n  {C.C}Context:{C.E}")
@@ -1040,6 +1097,8 @@ class IterDebugger:
         print("  6. Edit existing rules")
         print("  7. Auto-suggest fix")
         print("  8. Continue without change")
+        if fail.bt and len(fail.bt) > 1:
+            print("  b. Select different backtrace frame")
         print("  9. Save & quit")
         print("  0. Quit (no save)")
         
@@ -1063,6 +1122,26 @@ class IterDebugger:
                     return self._auto_suggest(fail)
                 elif choice == '8':
                     return None
+                elif choice.lower() == 'b' and fail.bt and len(fail.bt) > 1:
+                    print(f"\n{C.C}Select frame to patch:{C.E}")
+                    for entry in fail.bt:
+                        if isinstance(entry, dict):
+                            frame = entry.get('frame', '?')
+                            addr = entry.get('addr', 0)
+                            func = entry.get('func', '??')
+                            print(f"    #{frame}  0x{addr:08x}  {func or '??'}")
+                    
+                    frame_choice = input(f"\n{C.G}Frame number: {C.E}").strip()
+                    try:
+                        frame_num = int(frame_choice)
+                        for entry in fail.bt:
+                            if isinstance(entry, dict) and entry.get('frame') == frame_num:
+                                fail.addr = entry['addr']
+                                fail.func = entry.get('func', '')
+                                log.ok(f"Now targeting frame #{frame_num} at 0x{fail.addr:08x}")
+                                break
+                    except ValueError:
+                        pass
                 elif choice == '9':
                     self.save()
                     log.ok("Saved. Goodbye!")
