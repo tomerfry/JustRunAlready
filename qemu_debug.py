@@ -620,6 +620,12 @@ class IterDebugger:
             "set confirm off",
             "set print pretty on",
             "",
+            "# Suppress warnings about library format (cross-arch debugging)",
+            "set complaints 0",
+            "",
+            f"# Set sysroot to chroot for symbol resolution",
+            f"set sysroot {self.qemu.chroot}",
+            "",
             f"target remote localhost:{self.qemu.port}",
             "",
         ]
@@ -1085,8 +1091,14 @@ class IterDebugger:
         
         # Suggest showing output for non-signal failures
         if fail.type == FailType.UNKNOWN and fail.info.get('exit_code'):
-            print(f"\n  {C.Y}Tip:{C.E} Program exited with error. Try option 5 to see full output,")
-            print(f"       or re-run with arguments: --args -n -h  (to see program's help)")
+            exit_code = fail.info['exit_code']
+            print(f"\n  {C.Y}The program exited cleanly with error code {exit_code}.{C.E}")
+            print(f"  {C.Y}This usually means it failed a startup check (missing config, permissions, etc.){C.E}")
+            print(f"\n  {C.C}Suggestions:{C.E}")
+            print(f"    • Option 5: Show full output to see any error messages")
+            print(f"    • Run manually with strace to see what files it tries to open:")
+            print(f"      sudo chroot {self.qemu.chroot} /{self.qemu.cfg['qemu']} -strace {self.qemu.binary} {' '.join(self.qemu.args)}")
+            print(f"    • Check if it needs specific config files, directories, or permissions")
         
         print(f"\n{C.Y}Actions:{C.E}")
         print("  1. Skip call (jump past it)")
@@ -1099,6 +1111,8 @@ class IterDebugger:
         print("  8. Continue without change")
         if fail.bt and len(fail.bt) > 1:
             print("  b. Select different backtrace frame")
+        if fail.type == FailType.UNKNOWN and fail.info.get('exit_code'):
+            print("  s. Run with strace to see syscalls")
         print("  9. Save & quit")
         print("  0. Quit (no save)")
         
@@ -1142,6 +1156,8 @@ class IterDebugger:
                                 break
                     except ValueError:
                         pass
+                elif choice.lower() == 's' and fail.type == FailType.UNKNOWN:
+                    self._run_with_strace()
                 elif choice == '9':
                     self.save()
                     log.ok("Saved. Goodbye!")
@@ -1310,6 +1326,79 @@ quit
                     self.rules[idx].enabled = not self.rules[idx].enabled
                     state = "enabled" if self.rules[idx].enabled else "disabled"
                     log.info(f"Rule {state}")
+        except ValueError:
+            pass
+    
+    def _run_with_strace(self):
+        """Run the program with QEMU strace to see syscalls"""
+        log.info("Running with strace (this may take a moment)...")
+        
+        ld_path = "/lib:/usr/lib:/lib/arm-linux-gnueabihf:/usr/lib/arm-linux-gnueabihf"
+        
+        cmd = [
+            'sudo', 'chroot', str(self.qemu.chroot),
+            f"/{self.qemu.cfg['qemu']}",
+            '-E', f'LD_LIBRARY_PATH={ld_path}',
+            '-strace',
+            self.qemu.binary
+        ]
+        cmd.extend(self.qemu.args)
+        
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=10
+            )
+            
+            output = result.stderr  # strace output goes to stderr
+            
+            # Look for interesting syscalls
+            print(f"\n{C.C}=== Strace Output (filtered) ==={C.E}")
+            
+            interesting_patterns = [
+                (r'open\("([^"]+)".*= -\d+', 'File open failed'),
+                (r'access\("([^"]+)".*= -\d+', 'Access check failed'),
+                (r'stat\("([^"]+)".*= -\d+', 'Stat failed'),
+                (r'connect\(.*= -\d+', 'Connect failed'),
+                (r'bind\(.*= -\d+', 'Bind failed'),
+            ]
+            
+            issues_found = []
+            for line in output.split('\n'):
+                for pattern, desc in interesting_patterns:
+                    match = re.search(pattern, line)
+                    if match:
+                        issues_found.append((desc, line.strip()))
+                        break
+            
+            if issues_found:
+                print(f"\n{C.Y}Potential issues found:{C.E}")
+                seen = set()
+                for desc, line in issues_found[:20]:  # Limit output
+                    # Deduplicate
+                    key = line[:80]
+                    if key not in seen:
+                        seen.add(key)
+                        print(f"  {C.R}{desc}:{C.E} {line[:100]}")
+            else:
+                print(f"{C.DIM}No obvious failures detected in syscalls{C.E}")
+            
+            # Show last few lines of output
+            print(f"\n{C.C}Last lines of strace:{C.E}")
+            for line in output.strip().split('\n')[-15:]:
+                print(f"  {C.DIM}{line}{C.E}")
+            
+            # Show stdout if any
+            if result.stdout.strip():
+                print(f"\n{C.C}Program stdout:{C.E}")
+                print(result.stdout[:500])
+                
+        except subprocess.TimeoutExpired:
+            log.warn("Strace timed out (program may be waiting for input/connection)")
+        except Exception as e:
+            log.error(f"Strace failed: {e}")
         except ValueError:
             pass
     
